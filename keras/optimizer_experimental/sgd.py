@@ -60,6 +60,15 @@ class SGD(optimizer.Optimizer):
       no higher than this value.
     global_clipnorm: float. If set, the gradient of all weights is clipped
       so that their global norm is no higher than this value.
+    use_polyak_averaging: boolean, default to False. If True, polyak
+      averageing is applied.
+    polyak_averaging_momentum: float, default to None. The momentum of model
+      variables' moving average. new_average = polyak_averaging_momentum *
+      old_average + (1 - polyak_averaging_momentum) * current_variable_value.
+      If None, moving average is not stored in the optimizer.
+    polyak_averaging_overwrite_frequency: int, default to None. Every
+        polyak_averaging_overwrite_frequency steps of iterations, we overwrite
+        the model variable by its moving average.
     name: Optional name prefix for the operations created when applying
       gradients.  Defaults to `"SGD"`.
 
@@ -101,12 +110,19 @@ class SGD(optimizer.Optimizer):
                clipnorm=None,
                clipvalue=None,
                global_clipnorm=None,
+               use_polyak_averaging=False,
+               polyak_averaging_momentum=0.99,
+               polyak_averaging_overwrite_frequency=100,
                name='SGD'):
     super(SGD, self).__init__(
         name=name,
         clipnorm=clipnorm,
         clipvalue=clipvalue,
-        global_clipnorm=global_clipnorm)
+        global_clipnorm=global_clipnorm,
+        use_polyak_averaging=use_polyak_averaging,
+        polyak_averaging_momentum=polyak_averaging_momentum,
+        polyak_averaging_overwrite_frequency=polyak_averaging_overwrite_frequency
+    )
     self._learning_rate = self._build_learning_rate(learning_rate)
     self.momentum = momentum
     self.nesterov = nesterov

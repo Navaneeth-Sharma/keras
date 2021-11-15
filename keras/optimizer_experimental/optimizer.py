@@ -29,7 +29,14 @@ import tensorflow.compat.v2 as tf
 class _BaseOptimizer(tf.Module):
   """Optimizer base class, which only supports non-distribute use case."""
 
-  def __init__(self, name, clipnorm=None, clipvalue=None, global_clipnorm=None):
+  def __init__(self,
+               name,
+               clipnorm=None,
+               clipvalue=None,
+               global_clipnorm=None,
+               use_polyak_averaging=False,
+               polyak_averaging_momentum=0.99,
+               polyak_averaging_overwrite_frequency=100):
     """Create a new Optimizer.
 
     Args:
@@ -41,10 +48,33 @@ class _BaseOptimizer(tf.Module):
         no higher than this value.
       global_clipnorm: float. If set, the gradient of all weights is clipped
         so that their global norm is no higher than this value.
+      use_polyak_averaging: boolean, default to False. If True, polyak
+        averageing is applied.
+      polyak_averaging_momentum: float, default to None. The momentum of model
+        variables' moving average. new_average = polyak_averaging_momentum *
+        old_average + (1 - polyak_averaging_momentum) * current_variable_value.
+        If None, moving average is not stored in the optimizer.
+      polyak_averaging_overwrite_frequency: int, default to None. Every
+        polyak_averaging_overwrite_frequency steps of iterations, we overwrite
+        the model variable by its moving average.
     """
     self._name = name
     self._clipnorm = clipnorm
     self._global_clipnorm = global_clipnorm
+    self._use_polyak_averaging = use_polyak_averaging
+    if use_polyak_averaging:
+      # Verify the arguments related to polyak averaging.
+      if polyak_averaging_momentum > 1 or polyak_averaging_momentum < 0:
+        raise ValueError(f"polyak_averaging_momentum must be in the range of "
+                         f"[0, 1], but received {polyak_averaging_momentum}.")
+      if not isinstance(polyak_averaging_overwrite_frequency,
+                        int) or polyak_averaging_overwrite_frequency < 1:
+        raise ValueError(f"polyak_averaging_overwrite_frequency must be an "
+                         f"integer > 1, but received "
+                         f"{polyak_averaging_overwrite_frequency}.")
+    self._polyak_averaging_momentum = polyak_averaging_momentum
+    self._polyak_averaging_overwrite_frequency = polyak_averaging_overwrite_frequency
+
     if self._clipnorm is not None and self._global_clipnorm is not None:
       raise ValueError(f"At most one of `clipnorm` and `global_clipnorm` can "
                        f"be set. Received: clipnorm={self._clipnorm}, "
@@ -183,8 +213,16 @@ class _BaseOptimizer(tf.Module):
         SGD optimizer with momentum will store one momentum variable
         corresponding to each model variable.
     """
-    if not hasattr(self, "_index_dict"):
-      self._build_index_dict(var_list)
+    if getattr(self, "_built", False):
+      return
+    self._build_index_dict(var_list)
+    if self._use_polyak_averaging:
+      self._model_variables_moving_average = []
+      for var in var_list:
+        # Make a copy of the model variables, we will use the copy to store the
+        # moving average of model variables.
+        self._model_variables_moving_average.append(
+            self.add_variable_from_reference(var, "average", initial_value=var))
 
   def _build_index_dict(self, var_list):
     """Build variable to index dictionary.
@@ -382,7 +420,14 @@ class Optimizer(_BaseOptimizer):
   optimizer, please subclass this class instead of _BaseOptimizer.
   """
 
-  def __init__(self, name, clipnorm=None, clipvalue=None, global_clipnorm=None):
+  def __init__(self,
+               name,
+               clipnorm=None,
+               clipvalue=None,
+               global_clipnorm=None,
+               use_polyak_averaging=False,
+               polyak_averaging_momentum=0.99,
+               polyak_averaging_overwrite_frequency=100):
     """Create a new Optimizer.
 
     Args:
@@ -394,8 +439,19 @@ class Optimizer(_BaseOptimizer):
         no higher than this value.
       global_clipnorm: float. If set, the gradient of all weights is clipped
         so that their global norm is no higher than this value.
+      use_polyak_averaging: boolean, default to False. If True, polyak
+        averageing is applied.
+      polyak_averaging_momentum: float, default to None. The momentum of model
+        variables' moving average. new_average = polyak_averaging_momentum *
+        old_average + (1 - polyak_averaging_momentum) * current_variable_value.
+        If None, moving average is not stored in the optimizer.
+      polyak_averaging_overwrite_frequency: int, default to None. Every
+        polyak_averaging_overwrite_frequency steps of iterations, we overwrite
+        the model variable by its moving average.
     """
-    super().__init__(name, clipnorm, clipvalue, global_clipnorm)
+    super().__init__(name, clipnorm, clipvalue, global_clipnorm,
+                     use_polyak_averaging, polyak_averaging_momentum,
+                     polyak_averaging_overwrite_frequency)
     self._distribution_strategy = tf.distribute.get_strategy()
 
   def add_variable_from_reference(self,
@@ -448,6 +504,38 @@ class Optimizer(_BaseOptimizer):
     """
     return optimizer_utils.all_reduce_sum_gradients(grads_and_vars)
 
+  def _update_model_variables_moving_average(self, var_list):
+    """Update the stored moving average using the latest value."""
+    if self._use_polyak_averaging:
+      for (var, average) in zip(var_list, self._model_variables_moving_average):
+        average.assign(self._polyak_averaging_momentum * average +
+                       (1 - self._polyak_averaging_momentum) * var)
+
+  def override_model_variables_with_average_value(self, var_list):
+    """Override model variables with its moving average.
+
+    This function is only useful when `moving_average_decay` is set. Calling
+    this method would override model variables with the moving average stored
+    inside the optimizer.
+
+    Args:
+      var_list: List of model variables.
+
+    Returns:
+      None
+    """
+    if len(var_list) != len(self._model_variables_moving_average):
+      raise ValueError(f"The length of model variables ({len(var_list)}) to "
+                       f"override does not match the length of model variables "
+                       f"stored in the optimizer "
+                       f"({len(self._model_variables_moving_average)}). Please "
+                       f"check if the optimizer was called on your model.")
+    strategy = self._distribution_strategy
+    # Override model variable by the stored average value on all devices.
+    for var, average_var in zip(var_list, self._model_variables_moving_average):
+      strategy.extended.update(
+          var, lambda a, b: a.assign(b), args=(average_var,))
+
   def apply_gradients(self, grads_and_vars, skip_gradients_aggregation=False):
     """Apply gradients to variables.
 
@@ -484,6 +572,15 @@ class Optimizer(_BaseOptimizer):
       distribution.extended.update(
           var, apply_grad_to_update_var, args=(grad,), group=False)
     self.iterations.assign_add(1)
+
+    if self._use_polyak_averaging:
+      _, var_list = zip(*grads_and_vars)
+      self._update_model_variables_moving_average(var_list)
+      tf.cond(
+          self.iterations % self._polyak_averaging_overwrite_frequency == 0,
+          true_fn=lambda: self.override_model_variables_with_average_value(  # pylint: disable=g-long-lambda
+              var_list),
+          false_fn=lambda: None)
 
 
 class RestoredOptimizer(Optimizer):
